@@ -1,45 +1,136 @@
 import socket
-import pickle
-from threading import Thread
-from rsa import generate_keypair, decrypt
+import select
+import threading  
+import sys
+from rsacustom import decrypt, PublicKeyAuthority, generate_keypair
+from des import encryption, decryption
 
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+class Server:
+    def __init__(self):
+        self.host = '127.0.0.1'
+        self.port = 8080
+        self.threads = []
+        self.pka = PublicKeyAuthority()  # Public Key Authority
 
-    host = '127.0.0.1'
-    port = 8080
+        # Generate public and private keys for the server
+        public_key, private_key = generate_keypair()
+        self.pka.register_key("server", public_key, private_key)  # Register server's keys
 
-    server_socket.bind((host, port))
-    server_socket.listen(5)
+    def open_socket(self):
+        """Membuka socket server dan memulai mendengarkan koneksi."""
+        print(f"Starting server on {self.host}:{self.port}")
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        try:
+            print("Binding the server socket...")  # Debugging print
+            self.server.bind((self.host, self.port))
+            print("Server started successfully")  # Debugging print
+            self.server.listen(3)
+            print(f"Server is listening on {self.host}:{self.port}...")
+        except socket.error as e:
+            print(f"Failed to bind to {self.host}:{self.port} - Error: {e}")
+            sys.exit(1)
 
-    print('Server listening....')
+    def run(self):
+        """Memulai server untuk menerima koneksi klien."""
+        self.open_socket()
+        input_list = [self.server]
+        try:
+            while True:
+                print("Waiting for client connection...")
+                read_ready, _, _ = select.select(input_list, [], [])
+                for r in read_ready:
+                    if r == self.server:
+                        client_socket, client_address = self.server.accept()
+                        print(f"Connection established with {client_address}")
+                        c = Client(client_socket, client_address, input_list, self.pka)
+                        c.start()
+                        self.threads.append(c)
+                    else:
+                        print("Unexpected data received or connection issue")
+        except KeyboardInterrupt:
+            print("Shutting down the server...")
+        finally:
+            self.server.close()
+            for c in self.threads:
+                c.join()
 
-    return server_socket
+class Client(threading.Thread):
+    def __init__(self, client, address, input_list, pka):
+        threading.Thread.__init__(self)
+        self.sock = client
+        self.SOCKET_LIST = input_list
+        self.client = client
+        self.address = address
+        self.size = 1024
+        self.pka = pka
 
-def handle_client(client_socket, client_address, public_key, private_key):
-    print(f"Menerima koneksi dari {client_address}")
+    def run(self):
+        """Mengelola komunikasi dengan klien."""
+        try:
+            while True:
+                data = self.client.recv(self.size)
+                if data:
+                    try:
+                        # Pisahkan kunci DES terenkripsi dan pesan terenkripsi
+                        encrypted_des_key, encrypted_msg = data.split(b'|')
 
-    client_socket.send(pickle.dumps(public_key))
+                        # Dekripsi kunci DES menggunakan kunci privat RSA
+                        des_key = decrypt(self.pka.get_private_key("server"), encrypted_des_key)
 
-    while True:
-        encrypted_message = client_socket.recv(4096)
-        encrypted_message = pickle.loads(encrypted_message)
+                        # Dekripsi pesan menggunakan kunci DES
+                        decrypted = decryption(encrypted_msg.decode('utf-8'))
 
-        decrypted_message = decrypt(private_key, encrypted_message)
-        print(f"Menerima pesan terenkripsi dari {client_address}: {encrypted_message}")
-        print(f"Pesan terdekripsi: {decrypted_message}\n")
+                        print(f"\nCiphertext received: {encrypted_msg}")
+                        print(f"Decrypted Text: {decrypted}\n")
 
-        if decrypted_message == 'quit':
-            print(f"Klien {client_address} terputus")
-            client_socket.close()
-            break
+                        # Balas dengan pesan terenkripsi
+                        print("Masukkan Pesan untuk dikirim ke klien:")
+                        response = input()
+                        encrypted_response = encryption(response)
+                        self.client.send(encrypted_response.encode('utf-8'))
+                    except Exception as e:
+                        print(f"Error processing data: {e}")
+                        break
+                else:
+                    print(f"Client {self.address} closed the connection.")
+                    self.client.close()
+                    break
+        except Exception as e:
+            print(f"Error with client {self.address}: {e}")
+        finally:
+            if self.sock in self.SOCKET_LIST:
+                self.SOCKET_LIST.remove(self.sock)
+            self.client.close()
 
 if __name__ == "__main__":
-    server_socket = start_server()
-    public_key, private_key = generate_keypair()
+    try:
+        print("Starting the server...")
 
-    while True:
-        client_socket, addr = server_socket.accept()
+        # Kode tambahan untuk pengujian koneksi server
+        host = '127.0.0.1'
+        port = 8080
 
-        client_thread = Thread(target=handle_client, args=(client_socket, addr, public_key, private_key))
-        client_thread.start()
+        test_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            test_server.bind((host, port))
+            test_server.listen(1)
+            print(f"Test Server is listening on {host}:{port}...")
+            client, addr = test_server.accept()
+            print(f"Test Connection established with {addr}")
+            client.send(b"Hello from test server")
+            client.close()
+        except Exception as e:
+            print(f"Test Server Error: {e}")
+        finally:
+            test_server.close()
+
+        # Jalankan server utama
+        server = Server()
+        server.run()
+    except KeyboardInterrupt:
+        print("Server dihentikan.")
+        sys.exit(0)
